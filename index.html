@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stacked-Slice Renderer — ocean &amp; islands demo</title>
+<!--
+  stacked-slice-renderer: a single-file, zero-network demo.
+  No external scripts, fonts, images or requests of any kind.
+  The technique is explained honestly in TECHNICAL.md:
+  stacked offset horizontal pixel layers — NOT Mode 7.
+  v2: flyable (mouse steer, click roll, hold-to-thrust), voxel-stack
+  jet, clouds, cockpit HUD, altitude, 1.4 s camera transitions,
+  pixel-size setting. See TECHNICAL.md for what is and is not the
+  original UI8 fly demo.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #06121f; color: #d7e8f5;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 8px 0 4px; }
+  p { font-size: 14px; line-height: 1.5; color: #a9c6da; }
+  canvas { display: block; height: auto; image-rendering: pixelated;
+    background: #0b3d66; border: 1px solid #1d4a6b; }
+  .hud { display: flex; justify-content: space-between; font-size: 13px;
+    color: #8fb8cf; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  kbd { background: #12293d; border: 1px solid #2a4d68; border-radius: 4px;
+    padding: 0 5px; font-family: inherit; color: #d7e8f5; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Stacked-Slice Renderer</h1>
+  <p>Ocean + islands rendered as stacked offset horizontal pixel layers,
+  with parallax — and now flyable. <kbd>Mouse</kbd> steers,
+  <kbd>click</kbd> rolls, hold <kbd>mouse</kbd>/<kbd>W</kbd> for thrust,
+  <kbd>Shift</kbd> afterburner, <kbd>&uarr;</kbd> dives,
+  <kbd>&darr;</kbd> climbs, <kbd>Space</kbd> cycles the camera
+  (chase &rarr; overhead &rarr; cockpit), <kbd>[</kbd> / <kbd>]</kbd>
+  change pixel size. This is the UI8 fly-demo technique, explained in
+  <code>TECHNICAL.md</code> — stacked slices, not Mode 7.</p>
+  <canvas id="scene" width="320" height="180"></canvas>
+  <div class="hud"><span id="camera-label">camera: chase</span><span id="alt-label">alt: 110</span><span id="speed-label">speed: 1.0&times;</span><span id="pixel-label">pixel: 3px</span></div>
+  <p>Single file, zero network requests. Open this file in any browser —
+  nothing is fetched. The slice maths is pure JavaScript and is tested
+  headlessly by <code>test_slice_math.js</code> (Node, no dependencies).</p>
+</main>
+<script>
+"use strict";
+/* ------------------------------------------------------------------ */
+/* Stacked-slice renderer — pure slice maths (no DOM in this section). */
+/* These functions are the testable core. The Godot module in           */
+/* stacked_slice_renderer.gd implements the same maths in GDScript.    */
+/* ------------------------------------------------------------------ */
+
+var PIXEL_SIZE = 3;            // display block size; 3 = the original, as published
+var SLICE_HEIGHT = 4;          // px per horizontal layer, at 320x180
+var CANVAS_WIDTH = 320;
+var CANVAS_HEIGHT = 180;
+
+// Reference parameters, as published for the UI8 fly demo (see
+// TECHNICAL.md for the source). The demo is tuned to these, not to
+// invented values.
+var REF = {
+  speed: 92,                    // published speed value (display scale)
+  thrusterBoost: 1.8,           // Shift afterburner multiplier
+  turnRate: 1.25,               // rad/s
+  bankMaxDeg: 52,               // max bank angle, degrees
+  cruiseAltitude: 110,          // starting altitude
+  ceiling: 300,                 // max altitude
+  groundClearance: 7,           // min altitude (sea level + 7)
+  jetSize: 0.6,                 // published jet size factor
+  sliceSpacing: 1,              // px between voxel slices
+  viewChangeS: 1.4,             // camera transition time, seconds
+  chaseDistance: 2.6,           // chase camera distance, jet lengths
+  chaseHeightDeg: 12,           // chase camera height, degrees
+  chaseJetWidth: 0.19,          // chase jet width, in the original's units
+  islandDensity: 0.33,
+  cloudDensity: 0.45,
+  worldSeed: 7,
+  flameStyle: "realistic",
+  jetColours: { body: "#545969", accent: "#f0580e", canopy: "#1e8ca0" }
+};
+
+var CAMERAS = ["chase", "overhead", "cockpit"];
+
+// Camera parameters per view. horizonY is where the sea meets the sky;
+// sway is how much the slices swing with time. chaseDistance /
+// chaseHeightDeg are the reference chase-camera geometry (2.6 jet
+// lengths back, 12 deg up); they set the chase ship's screen size.
+var CAMERA_PARAMS = {
+  chase:    { horizonY: 70, sway: 6,  ship: "sprite",  label: "chase",
+              chaseDistance: REF.chaseDistance, chaseHeightDeg: REF.chaseHeightDeg },
+  overhead: { horizonY: 18, sway: 2,  ship: "topdown", label: "overhead" },
+  cockpit:  { horizonY: 84, sway: 10, ship: "frame",   label: "cockpit" }
+};
+
+// Fictional islands. x: -1..1 across the world, z: distance ahead
+// (0 = at the horizon, 100 = passing the camera), r: radius, h: height.
+var ISLANDS = [
+  { x: -0.55, z: 20, r: 16, h: 14 },
+  { x:  0.35, z: 45, r: 22, h: 18 },
+  { x: -0.10, z: 70, r: 12, h: 10 },
+  { x:  0.70, z: 88, r: 18, h: 12 },
+  { x: -0.85, z: 60, r: 10, h: 8 }
+];
+
+// Clouds: same world as the islands, different layer. 12 slots; a
+// slot is active when its deterministic hash is below the reference
+// cloud density (0.45), so roughly half the slots hold a cloud.
+var CLOUDS = [];
+for (var ci = 0; ci < 12; ci++) {
+  CLOUDS.push({
+    x: (hash01(ci * 13 + 5) * 1.7 - 0.85),
+    z: 10 + hash01(ci * 29 + 3) * 85,
+    r: 10 + hash01(ci * 7 + 11) * 16,
+    h: 4 + hash01(ci * 17 + 2) * 5,
+    active: hash01(ci * 31 + 9) < REF.cloudDensity
+  });
+}
+
+// The voxel-stack jet: horizontal slices from tail (index 0) to nose
+// (last index). Each slice is one cross-section of the jet; a
+// renderer stacks them vertically and shifts each slice sideways by
+// bank * index * sliceSpacing, which reveals side faces when the jet
+// banks — the actual UI8 trick. halfWidth is in logical pixels;
+// total jet width is 8 px = 2.5% of the 320 px screen (reference:
+// ~2-3% of screen width). Colours are the reference jet colours.
+var JET_SLICES = [
+  { halfWidth: 1, wing: 0, role: "engine" },   // tail / flame root
+  { halfWidth: 2, wing: 0, role: "hull" },
+  { halfWidth: 3, wing: 0, role: "hull" },
+  { halfWidth: 3, wing: 1, role: "hull" },     // wings start
+  { halfWidth: 3, wing: 1, role: "hull" },
+  { halfWidth: 3, wing: 1, role: "hull" },
+  { halfWidth: 2, wing: 0, role: "hull" },
+  { halfWidth: 2, wing: 0, role: "hull" },
+  { halfWidth: 2, wing: 0, role: "hull" },
+  { halfWidth: 1, wing: 0, role: "canopy" },   // canopy
+  { halfWidth: 1, wing: 0, role: "canopy" },
+  { halfWidth: 1, wing: 0, role: "hull" },
+  { halfWidth: 1, wing: 0, role: "hull" }      // nose
+];
+var JET_ROW_HEIGHT = 2;   // px per slice row on screen
+
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+function wrap(value, period) {
+  var r = value % period;
+  return r < 0 ? r + period : r;
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function smoothstep(t) {
+  t = clamp(t, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+// Deterministic 0..1 hash of an integer — used for sparkle and for
+// respawning islands, so the demo is reproducible, not random per run.
+function hash01(n) {
+  var x = (n * 2654435761) >>> 0;
+  x ^= x >>> 13; x = (x * 1274126177) >>> 0; x ^= x >>> 16;
+  return (x >>> 0) / 4294967296;
+}
+
+// How far a slice is from the horizon: 0 at the horizon, 1 at the
+// bottom of the screen. Everything else (offset, colour, texture
+// speed) is a function of depth, which is what makes the flat layers
+// read as a receding plane.
+function sliceDepth(y, horizonY, height) {
+  if (height <= horizonY) { return 0; }
+  return clamp((y - horizonY) / (height - horizonY), 0, 1);
+}
+
+// Horizontal offset of one slice, in pixels. Three parts:
+//  * sway: a slow sine that grows with depth (near slices swing more),
+//  * wave: a per-row ripple that also grows with depth,
+//  * lateral: the world sliding sideways as the jet turns (heading).
+// Near slices move more than far ones — that difference IS the parallax.
+function sliceOffset(y, time, params, lateral) {
+  var depth = sliceDepth(y, params.horizonY, CANVAS_HEIGHT);
+  var sway = Math.sin(time * 0.6) * params.sway * depth;
+  var wave = Math.sin(y * 0.35 + time * 1.7) * (1 + depth * 5);
+  return sway + wave + (lateral || 0) * depth;
+}
+
+// How far the ocean texture on one slice has scrolled, in pixels.
+// Near slices scroll faster than far ones, so the sea appears to flow
+// towards the viewer. Wraps every 16 px (the dash spacing).
+function sliceTextureOffset(y, time, speed, params) {
+  var depth = sliceDepth(y, params.horizonY, CANVAS_HEIGHT);
+  return wrap(time * speed * 24 * depth, 16);
+}
+
+// Ocean colour for a slice: bright blue at the horizon, brighter
+// still near the viewer (reference: bright blue ocean, not navy).
+// Returns [r, g, b].
+function oceanColor(depth) {
+  var d = clamp(depth, 0, 1);
+  return [
+    Math.round(16 + (63 - 16) * d),
+    Math.round(96 + (184 - 96) * d),
+    Math.round(180 + (220 - 180) * d)
+  ];
+}
+
+function rgb(c) { return "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")"; }
+
+// Project one island (or cloud — same projection) into screen space
+// for the current camera. Returns {x, y, r, h, visible}. y is the
+// object's waterline; it is drawn as stacked slices from y-h up to y.
+function projectIsland(island, params) {
+  var t = clamp(1 - island.z / 100, 0, 1);   // 0 far, 1 near
+  var horizonY = params.horizonY;
+  var y = horizonY + t * t * (CANVAS_HEIGHT - horizonY);
+  var scale = 0.25 + t * 1.9;
+  var x = CANVAS_WIDTH / 2 + island.x * 150 * (0.4 + t * 1.1);
+  return {
+    x: x, y: y,
+    r: island.r * scale,
+    h: island.h * scale,
+    visible: island.z > 1 && island.z < 100
+  };
+}
+
+// Next camera in the cycle: chase -> overhead -> cockpit -> chase.
+function nextCamera(camera) {
+  var i = CAMERAS.indexOf(camera);
+  return CAMERAS[(i + 1) % CAMERAS.length];
+}
+
+// Chase jet width on screen, in logical pixels. 8 px = 2.5% of the
+// 320 px screen — the reference jet is ~2-3% of screen width. The
+// chase distance (2.6 jet lengths) sets this: width = screen /
+// (chaseDistance * jetLengthFactor), clamped to the reference band.
+function jetWidthPx() {
+  var w = Math.round(CANVAS_WIDTH * 0.025);
+  return Math.max(6, Math.min(10, w));
+}
+
+// How much the sky has darkened toward space: 0 below altitude 120,
+// rising to 0.7 at altitude 220+. Above ~120 the sky darkens and
+// stars fade in (reference behaviour).
+function skyDarkness(altitude) {
+  return clamp((altitude - 120) / 100, 0, 0.7);
+}
+
+// Island/cloud apparent size vs altitude: higher = smaller.
+function altScale(altitude) {
+  return clamp(1.15 - altitude / 300, 0.55, 1.15);
+}
+
+/* ------------------------------------------------------------------ */
+/* Rendering — DOM / Canvas only below this line.                      */
+/* ------------------------------------------------------------------ */
+
+var canvas = (typeof document !== "undefined")
+  ? document.getElementById("scene") : null;
+var ctx = canvas ? canvas.getContext("2d") : null;
+var cameraLabel = (typeof document !== "undefined")
+  ? document.getElementById("camera-label") : null;
+var speedLabel = (typeof document !== "undefined")
+  ? document.getElementById("speed-label") : null;
+var altLabel = (typeof document !== "undefined")
+  ? document.getElementById("alt-label") : null;
+var pixelLabel = (typeof document !== "undefined")
+  ? document.getElementById("pixel-label") : null;
+
+var state = {
+  camera: "chase",
+  camFrom: "chase", camTo: "chase", camT: 1,  // view transition progress
+  speed: 1.0,
+  time: 0,
+  islandSeed: 1000,   // increments each time an island respawns
+  cloudSeed: 2000,    // increments each time a cloud respawns
+  heading: 0,         // radians; the world slides sideways as it changes
+  worldX: 0,          // accumulated lateral world shift from turning
+  bank: 0,            // -1..1, smoothed turn input
+  altitude: REF.cruiseAltitude,
+  thrust: false,
+  afterburner: false,
+  rollT: 0,           // barrel-roll timer, seconds remaining
+  pixelSize: PIXEL_SIZE
+};
+
+var keys = {};        // currently held keys, by e.code
+var mouse = { x: null, y: null, down: false, downTime: 0 };
+
+function effectiveSpeed() {
+  return state.speed * (state.afterburner ? REF.thrusterBoost : 1.0);
+}
+
+// Camera parameters actually in effect this frame: during a view
+// transition (1.4 s) horizon and sway blend from the old camera to
+// the new one; the ship/view mode switches at the halfway point.
+function currentCameraParams() {
+  var from = CAMERA_PARAMS[state.camFrom];
+  var to = CAMERA_PARAMS[state.camTo];
+  var t = smoothstep(state.camT);
+  var horizonY = lerp(from.horizonY, to.horizonY, t);
+  // Altitude moves the horizon: climbing shows more sky (horizon
+  // rises on screen), diving shows more sea.
+  horizonY = clamp(horizonY - (state.altitude - REF.cruiseAltitude) * 0.08, 20, 130);
+  return {
+    horizonY: horizonY,
+    sway: lerp(from.sway, to.sway, t),
+    ship: state.camT > 0.5 ? to.ship : from.ship,
+    camera: state.camT > 0.5 ? state.camTo : state.camFrom,
+    label: state.camT > 0.5 ? to.label : from.label
+  };
+}
+
+function setPixelSize(n) {
+  state.pixelSize = clamp(Math.round(n), 1, 6);
+  if (canvas && canvas.style) {
+    canvas.style.width = (CANVAS_WIDTH * state.pixelSize) + "px";
+  }
+  if (pixelLabel) { pixelLabel.textContent = "pixel: " + state.pixelSize + "px"; }
+  return state.pixelSize;
+}
+
+function getPixelSize() { return state.pixelSize; }
+
+function drawSky(params) {
+  var dark = skyDarkness(state.altitude);
+  // Flat gradient sky, drawn as stacked slices too (same primitive).
+  for (var y = 0; y < params.horizonY; y += SLICE_HEIGHT) {
+    var d = clamp(y / Math.max(params.horizonY, 1), 0, 1);
+    var r = Math.round(lerp(10 + 90 * d, 4, dark)),
+        g = Math.round(lerp(30 + 110 * d, 6, dark)),
+        b = Math.round(lerp(60 + 130 * d, 16, dark));
+    ctx.fillStyle = rgb([r, g, b]);
+    ctx.fillRect(0, y, CANVAS_WIDTH, SLICE_HEIGHT);
+  }
+  // Stars fade in as the sky darkens above altitude ~120.
+  if (dark > 0.05) {
+    for (var i = 0; i < 40; i++) {
+      var sx = hash01(i * 3 + 11) * CANVAS_WIDTH;
+      var sy = hash01(i * 7 + 5) * params.horizonY;
+      var big = hash01(i * 13 + 2) > 0.8;
+      ctx.fillStyle = "rgba(255,255,255," + dark.toFixed(2) + ")";
+      ctx.fillRect(Math.round(sx), Math.round(sy), big ? 2 : 1, big ? 2 : 1);
+    }
+  }
+  // Sun: a fixed disc, for a horizon reference point (fades with dark).
+  ctx.fillStyle = dark > 0.5 ? "#c9b183" : "#ffe9a8";
+  ctx.fillRect(CANVAS_WIDTH - 62, 18, 18, 18);
+}
+
+function drawOcean(time, params) {
+  for (var y = params.horizonY; y < CANVAS_HEIGHT; y += SLICE_HEIGHT) {
+    var depth = sliceDepth(y, params.horizonY, CANVAS_HEIGHT);
+    var off = sliceOffset(y, time, params, state.worldX);
+    ctx.fillStyle = rgb(oceanColor(depth));
+    ctx.fillRect(0, y, CANVAS_WIDTH, SLICE_HEIGHT);
+    // Wave dashes: short dark/light marks, scrolled by depth so the
+    // near sea flows faster than the far sea.
+    var tex = sliceTextureOffset(y, time, effectiveSpeed(), params);
+    ctx.fillStyle = depth > 0.5 ? "rgba(255,255,255,0.18)"
+                                : "rgba(0,0,0,0.20)";
+    for (var x = -16; x < CANVAS_WIDTH + 16; x += 16) {
+      var sparkle = hash01(Math.floor(y / SLICE_HEIGHT) * 31 +
+                           Math.floor(time * 2)) > 0.6;
+      ctx.fillRect(x + tex + off, y + 1, sparkle ? 7 : 4, 1);
+    }
+  }
+  // Wake / spray when flying low over the sea.
+  if (state.altitude < 20) {
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    for (var wx = 0; wx < CANVAS_WIDTH; wx += 24) {
+      var spray = hash01(Math.floor(wx / 24) * 17 + Math.floor(time * 6)) > 0.5;
+      ctx.fillRect(wx + (spray ? 4 : 0), CANVAS_HEIGHT - 4, spray ? 8 : 5, 1);
+    }
+  }
+}
+
+function drawIsland(island, time, params) {
+  var p = projectIsland(island, params);
+  if (!p.visible || p.r < 1) { return; }
+  var s = altScale(state.altitude);
+  var r = p.r * s, h = p.h * s;
+  // Terraced islands: three bands (bright green / green / sand) with
+  // a darker step line at each terrace boundary — the reference look.
+  for (var dy = -h; dy <= 0; dy += 2) {
+    var y = Math.round(p.y + dy);
+    if (y < params.horizonY || y >= CANVAS_HEIGHT) { continue; }
+    var f = 1 - (dy / h) * (dy / h);           // 0 at top, 1 at base
+    var half = Math.max(1, r * Math.sqrt(Math.max(f, 0)));
+    var off = sliceOffset(y, time, params, state.worldX);
+    var frac = -dy / h;                        // 1 at top, 0 at base
+    var colour;
+    if (frac > 0.66) { colour = "#4caf5e"; }
+    else if (frac > 0.33) { colour = "#3f8f4f"; }
+    else { colour = "#d9c27a"; }
+    var terrace = (Math.round(-dy) % 8 === 0) && frac <= 0.66;
+    ctx.fillStyle = terrace ? "#2c6b38" : colour;
+    ctx.fillRect(Math.round(p.x - half + off), y, Math.round(half * 2), 2);
+  }
+}
+
+function drawCloud(cloud, time, params) {
+  if (!cloud.active) { return; }
+  var p = projectIsland(cloud, params);
+  if (!p.visible || p.r < 1) { return; }
+  var s = altScale(state.altitude);
+  var r = p.r * s, h = p.h * s;
+  // Clouds are stacked slices like islands: white on top, grey-blue
+  // shadow underneath. Flying through one (z < 12) whites out the
+  // screen briefly.
+  for (var dy = -h; dy <= 0; dy += 2) {
+    var y = Math.round(p.y + dy);
+    if (y < 0 || y >= CANVAS_HEIGHT) { continue; }
+    var f = 1 - (dy / h) * (dy / h);
+    var half = Math.max(1, r * Math.sqrt(Math.max(f, 0)));
+    var off = sliceOffset(y, time, params, state.worldX);
+    ctx.fillStyle = (-dy / h) > 0.4 ? "#f4f8ff" : "#d7e4f2";
+    ctx.fillRect(Math.round(p.x - half + off), y, Math.round(half * 2), 2);
+  }
+  if (cloud.z < 12) {
+    ctx.fillStyle = "rgba(244,248,255,0.30)";
+    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  }
+}
+
+// The voxel-stack jet, chase view. Slices stack vertically (tail at
+// the bottom, nose at the top); each slice shifts sideways by bank *
+// index * sliceSpacing, revealing a darker side face — the UI8 trick.
+// The flame is a separate layer at the tail, flickering with thrust.
+function drawVoxelJet(time, params) {
+  var cx = CANVAS_WIDTH / 2;
+  var base = CANVAS_HEIGHT - 18;
+  var bank = state.bank;
+  if (state.rollT > 0) {
+    bank += Math.sin((1 - state.rollT / 0.5) * Math.PI * 2) * 0.8;
+  }
+  var cols = REF.jetColours;
+  var wScale = jetWidthPx() / 8;   // jet model is 8 px wide at scale 1
+  for (var i = 0; i < JET_SLICES.length; i++) {
+    var slice = JET_SLICES[i];
+    var y = base - i * JET_ROW_HEIGHT;
+    var off = bank * i * REF.sliceSpacing * 0.9;
+    var half = Math.max(1, Math.round(slice.halfWidth * wScale));
+    var wing = Math.round(slice.wing * wScale);
+    var x0 = Math.round(cx + off);
+    var colour = cols.body;
+    if (slice.role === "canopy") { colour = cols.canopy; }
+    // Side face: the darker edge on the side the slices shift toward.
+    if (Math.abs(off) > 0.5) {
+      ctx.fillStyle = "#33363f";
+      var sideX = off > 0 ? x0 + half : x0 - half - 1;
+      ctx.fillRect(sideX, y, 1, JET_ROW_HEIGHT);
+    }
+    // Wings on the wing rows, accent tips.
+    if (wing > 0) {
+      ctx.fillStyle = "#3f424e";
+      ctx.fillRect(x0 - half - wing, y, wing, JET_ROW_HEIGHT);
+      ctx.fillRect(x0 + half, y, wing, JET_ROW_HEIGHT);
+      ctx.fillStyle = cols.accent;
+      ctx.fillRect(x0 - half - wing, y, 1, JET_ROW_HEIGHT);
+      ctx.fillRect(x0 + half + wing - 1, y, 1, JET_ROW_HEIGHT);
+    }
+    ctx.fillStyle = colour;
+    ctx.fillRect(x0 - half, y, half * 2, JET_ROW_HEIGHT);
+  }
+  // Flame layer: separate, animated, tied to thrust.
+  var flameLen = state.thrust
+    ? 4 + Math.floor(hash01(Math.floor(time * 10)) * 7)
+    : 2;
+  for (var f = 0; f < flameLen; f++) {
+    var fw = Math.max(1, 3 - Math.floor(f / 3));
+    ctx.fillStyle = f < 2 ? "#ffd166" : cols.accent;
+    ctx.fillRect(Math.round(cx - fw / 2), base + 2 + f * 2, fw, 2);
+  }
+  // Wingtip contrails in a bank, while thrusting.
+  if (state.thrust && Math.abs(state.bank) > 0.4) {
+    for (var c = 0; c < 3; c++) {
+      var alpha = (0.5 - c * 0.15).toFixed(2);
+      ctx.fillStyle = "rgba(255,255,255," + alpha + ")";
+      var dir = state.bank > 0 ? -1 : 1;
+      ctx.fillRect(Math.round(cx - dir * (6 + c * 3)), base + 4 + c * 4, 3, 1);
+      ctx.fillRect(Math.round(cx + dir * (6 + c * 3)), base + 4 + c * 4, 3, 1);
+    }
+  }
+}
+
+// True top-down world view (overhead camera): the ocean fills the
+// screen, islands and clouds are mapped from world coordinates
+// (x across, z down the screen), and the jet sits centred at the
+// same logical size as in chase view — jet size is constant across
+// cameras and across pixel-size settings, because all geometry is
+// in logical pixels.
+function drawOverhead(time) {
+  ctx.fillStyle = rgb(oceanColor(0.6));
+  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  var tex = sliceTextureOffset(90, time, effectiveSpeed(), CAMERA_PARAMS.overhead);
+  ctx.fillStyle = "rgba(255,255,255,0.15)";
+  for (var gx = -16; gx < CANVAS_WIDTH + 16; gx += 16) {
+    for (var gy = 0; gy < CANVAS_HEIGHT; gy += 16) {
+      ctx.fillRect(gx + tex, gy + 1, 4, 1);
+    }
+  }
+  for (var i = 0; i < ISLANDS.length; i++) {
+    var isl = ISLANDS[i];
+    var ix = CANVAS_WIDTH / 2 + isl.x * 140;
+    var iy = 20 + (isl.z / 100) * (CANVAS_HEIGHT - 40);
+    var ir = Math.max(2, isl.r * 0.9);
+    ctx.fillStyle = "#d9c27a";
+    ctx.fillRect(Math.round(ix - ir), Math.round(iy - ir * 0.6), Math.round(ir * 2), Math.round(ir * 1.2));
+    ctx.fillStyle = "#3f8f4f";
+    ctx.fillRect(Math.round(ix - ir * 0.7), Math.round(iy - ir * 0.6), Math.round(ir * 1.4), Math.round(ir * 0.7));
+  }
+  for (var j = 0; j < CLOUDS.length; j++) {
+    if (!CLOUDS[j].active) { continue; }
+    var cl = CLOUDS[j];
+    var cx2 = CANVAS_WIDTH / 2 + cl.x * 140;
+    var cy2 = 20 + (cl.z / 100) * (CANVAS_HEIGHT - 40);
+    ctx.fillStyle = "rgba(244,248,255,0.9)";
+    ctx.fillRect(Math.round(cx2 - cl.r * 0.7), Math.round(cy2 - 3), Math.round(cl.r * 1.4), 5);
+  }
+  // Jet, centred, top-down, same 8 px width as chase view.
+  var jx = CANVAS_WIDTH / 2, jy = CANVAS_HEIGHT / 2;
+  ctx.save();
+  ctx.translate(jx, jy);
+  ctx.rotate(state.heading);
+  var cols = REF.jetColours;
+  ctx.fillStyle = cols.body;
+  ctx.fillRect(-2, -11, 4, 22);              // hull, nose up
+  ctx.fillRect(-6, 2, 4, 3);                 // left wing
+  ctx.fillRect(2, 2, 4, 3);                  // right wing
+  ctx.fillStyle = cols.canopy;
+  ctx.fillRect(-1, -8, 2, 4);                // canopy
+  ctx.fillStyle = cols.accent;
+  ctx.fillRect(-1, 11, 2, 3);                // engine
+  ctx.restore();
+  // Crosshair + north marker.
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.fillRect(jx - 8, jy, 16, 1);
+  ctx.fillRect(jx, jy - 8, 1, 16);
+  ctx.fillStyle = "#d7e8f5";
+  ctx.font = "8px monospace";
+  ctx.fillText("N", 4, 10);
+}
+
+// Cockpit HUD: altitude, speed, artificial horizon, radar, reticle.
+// The horizon and radar roll with the jet's bank, as in the reference.
+function drawHUD(time) {
+  var cols = REF.jetColours;
+  // Frame.
+  ctx.fillStyle = "#101820";
+  ctx.fillRect(0, 0, CANVAS_WIDTH, 10);
+  ctx.fillRect(0, CANVAS_HEIGHT - 10, CANVAS_WIDTH, 10);
+  ctx.fillRect(0, 0, 14, CANVAS_HEIGHT);
+  ctx.fillRect(CANVAS_WIDTH - 14, 0, 14, CANVAS_HEIGHT);
+  ctx.fillStyle = "#2b3a48";
+  ctx.beginPath();
+  ctx.moveTo(CANVAS_WIDTH / 2 - 14, CANVAS_HEIGHT);
+  ctx.lineTo(CANVAS_WIDTH / 2, CANVAS_HEIGHT - 26);
+  ctx.lineTo(CANVAS_WIDTH / 2 + 14, CANVAS_HEIGHT);
+  ctx.closePath();
+  ctx.fill();
+  // Readouts.
+  ctx.fillStyle = "#d7e8f5";
+  ctx.font = "8px monospace";
+  ctx.fillText("ALT " + Math.round(state.altitude), 18, 20);
+  ctx.fillText("SPD " + (effectiveSpeed()).toFixed(1) + "x", 18, 30);
+  ctx.fillText("HDG " + Math.round(((state.heading * 180 / Math.PI) % 360 + 360) % 360), 18, 40);
+  // Artificial horizon: a gauge that rolls with the bank.
+  var hx = 40, hy = CANVAS_HEIGHT - 34, hr = 16;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(hx, hy, hr, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.translate(hx, hy);
+  ctx.rotate(-state.bank * REF.bankMaxDeg * Math.PI / 180);
+  ctx.fillStyle = "#3f7fb8";
+  ctx.fillRect(-hr, -hr, hr * 2, hr);
+  ctx.fillStyle = "#8a6b3f";
+  ctx.fillRect(-hr, 0, hr * 2, hr);
+  ctx.restore();
+  ctx.fillStyle = "#d7e8f5";
+  ctx.beginPath();
+  ctx.arc(hx, hy, hr, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillRect(hx - 6, hy, 12, 1);
+  // Radar: island + cloud blips relative to the jet.
+  var rx = CANVAS_WIDTH - 40, ry = CANVAS_HEIGHT - 34, rr = 16;
+  ctx.fillStyle = "rgba(16,32,48,0.85)";
+  ctx.beginPath();
+  ctx.arc(rx, ry, rr, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#3f8f4f";
+  for (var i = 0; i < ISLANDS.length; i++) {
+    var bx = rx + ISLANDS[i].x * rr * 0.8;
+    var by = ry - (1 - ISLANDS[i].z / 100) * rr * 0.8;
+    ctx.fillRect(Math.round(bx - 1), Math.round(by - 1), 2, 2);
+  }
+  ctx.fillStyle = "#f4f8ff";
+  for (var j = 0; j < CLOUDS.length; j++) {
+    if (!CLOUDS[j].active) { continue; }
+    var cx3 = rx + CLOUDS[j].x * rr * 0.8;
+    var cy3 = ry - (1 - CLOUDS[j].z / 100) * rr * 0.8;
+    ctx.fillRect(Math.round(cx3 - 1), Math.round(cy3 - 1), 2, 2);
+  }
+  ctx.fillStyle = cols.accent;
+  ctx.fillRect(rx - 1, ry - 1, 2, 2);
+  // Reticle.
+  ctx.fillStyle = "rgba(255,255,255,0.7)";
+  var cx4 = CANVAS_WIDTH / 2, cy4 = CANVAS_HEIGHT / 2;
+  ctx.fillRect(cx4 - 8, cy4, 16, 1);
+  ctx.fillRect(cx4, cy4 - 8, 1, 16);
+}
+
+function step(dt) {
+  state.time += dt;
+  if (state.camT < 1) {
+    state.camT = Math.min(1, state.camT + dt / REF.viewChangeS);
+  }
+  if (state.rollT > 0) { state.rollT = Math.max(0, state.rollT - dt); }
+  // --- Flight model ---
+  var steer = 0;
+  if (keys["ArrowLeft"]) { steer -= 1; }
+  if (keys["ArrowRight"]) { steer += 1; }
+  if (mouse.x !== null) {
+    steer += clamp((mouse.x - CANVAS_WIDTH / 2) / 80, -1, 1);
+  }
+  steer = clamp(steer, -1, 1);
+  state.heading += steer * REF.turnRate * dt;
+  state.bank += (steer - state.bank) * Math.min(1, dt * 6);
+  var wantThrust = !!(keys["KeyW"] || mouse.down);
+  state.thrust = wantThrust;
+  var target = wantThrust ? 3.0 : 1.0;
+  if (keys["KeyS"]) { target = 0.25; }
+  state.speed += (target - state.speed) * Math.min(1, dt * 1.2);
+  state.afterburner = !!(keys["ShiftLeft"] || keys["ShiftRight"]);
+  // ArrowUp dives, ArrowDown climbs (reference control scheme).
+  if (keys["ArrowUp"]) { state.altitude -= 45 * dt; }
+  if (keys["ArrowDown"]) { state.altitude += 45 * dt; }
+  state.altitude = clamp(state.altitude, REF.groundClearance, REF.ceiling);
+  state.worldX += Math.sin(state.heading) * effectiveSpeed() * dt * 30;
+  state.worldX = clamp(state.worldX, -60, 60);   // lateral drift is bounded
+  if (Math.abs(steer) < 0.05) {
+    state.worldX *= Math.exp(-0.5 * dt);          // and eases back when level
+  }
+  // --- World advance ---
+  var adv = effectiveSpeed() * dt;
+  for (var i = 0; i < ISLANDS.length; i++) {
+    ISLANDS[i].z -= adv * 6;
+    if (ISLANDS[i].z <= 1) {
+      state.islandSeed += 1;
+      ISLANDS[i].z = 95;
+      ISLANDS[i].x = hash01(state.islandSeed) * 1.7 - 0.85;
+      ISLANDS[i].r = 9 + hash01(state.islandSeed + 7) * 14;
+      ISLANDS[i].h = 7 + hash01(state.islandSeed + 13) * 12;
+    }
+  }
+  for (var j = 0; j < CLOUDS.length; j++) {
+    CLOUDS[j].z -= adv * 4;
+    if (CLOUDS[j].z <= 1) {
+      state.cloudSeed += 1;
+      CLOUDS[j].z = 95;
+      CLOUDS[j].x = hash01(state.cloudSeed) * 1.7 - 0.85;
+      CLOUDS[j].r = 10 + hash01(state.cloudSeed + 5) * 16;
+      CLOUDS[j].h = 4 + hash01(state.cloudSeed + 11) * 5;
+      CLOUDS[j].active = hash01(state.cloudSeed + 21) < REF.cloudDensity;
+    }
+  }
+  if (!ctx) { return; }
+  var params = currentCameraParams();
+  ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  if (params.camera === "overhead") {
+    drawOverhead(state.time);
+  } else {
+    drawSky(params);
+    drawOcean(state.time, params);
+    for (var k = 0; k < ISLANDS.length; k++) { drawIsland(ISLANDS[k], state.time, params); }
+    for (var m = 0; m < CLOUDS.length; m++) { drawCloud(CLOUDS[m], state.time, params); }
+    if (params.ship === "sprite") {
+      drawVoxelJet(state.time, params);
+    } else if (params.ship === "frame") {
+      drawHUD(state.time);
+    }
+  }
+  if (cameraLabel) { cameraLabel.textContent = "camera: " + params.label; }
+  if (speedLabel) { speedLabel.textContent = "speed: " + effectiveSpeed().toFixed(1) + "×"; }
+  if (altLabel) { altLabel.textContent = "alt: " + Math.round(state.altitude); }
+  if (pixelLabel) { pixelLabel.textContent = "pixel: " + state.pixelSize + "px"; }
+}
+
+function cycleCamera() {
+  state.camFrom = state.camera;
+  state.camTo = nextCamera(state.camera);
+  state.camera = state.camTo;
+  state.camT = 0;
+  if (cameraLabel) { cameraLabel.textContent = "camera: " + state.camTo; }
+}
+
+function startRoll() {
+  if (state.rollT <= 0) { state.rollT = 0.5; }
+}
+
+if (typeof document !== "undefined" && canvas) {
+  document.addEventListener("keydown", function (e) {
+    keys[e.code] = true;
+    if (e.code === "Space") { e.preventDefault(); cycleCamera(); }
+    if (e.code === "BracketLeft") { setPixelSize(state.pixelSize - 1); }
+    if (e.code === "BracketRight") { setPixelSize(state.pixelSize + 1); }
+  });
+  document.addEventListener("keyup", function (e) {
+    keys[e.code] = false;
+  });
+  if (canvas.addEventListener) {
+    canvas.addEventListener("mousemove", function (e) {
+      mouse.x = (typeof e.offsetX === "number") ? e.offsetX : null;
+      mouse.y = (typeof e.offsetY === "number") ? e.offsetY : null;
+    });
+    canvas.addEventListener("mousedown", function (e) {
+      mouse.down = true;
+      mouse.downTime = Date.now();
+    });
+    canvas.addEventListener("mouseup", function () {
+      if (mouse.down && Date.now() - mouse.downTime < 200) { startRoll(); }
+      mouse.down = false;
+    });
+    canvas.addEventListener("mouseleave", function () {
+      mouse.x = null; mouse.y = null; mouse.down = false;
+    });
+  }
+  setPixelSize(state.pixelSize);
+  var last = 0;
+  (function frame(ts) {
+    var dt = Math.min((ts - last) / 1000 || 0.016, 0.05);
+    last = ts;
+    step(dt);
+    requestAnimationFrame(frame);
+  })(0);
+}
+
+// Node harness entry point: test_slice_math.js loads this file and
+// reads these exports. In the browser `module` is undefined, so this
+// block is inert there.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    SLICE_HEIGHT: SLICE_HEIGHT, CANVAS_WIDTH: CANVAS_WIDTH,
+    CANVAS_HEIGHT: CANVAS_HEIGHT, CAMERAS: CAMERAS,
+    CAMERA_PARAMS: CAMERA_PARAMS, ISLANDS: ISLANDS, CLOUDS: CLOUDS,
+    JET_SLICES: JET_SLICES, REF: REF,
+    clamp: clamp, wrap: wrap, hash01: hash01,
+    sliceDepth: sliceDepth, sliceOffset: sliceOffset,
+    sliceTextureOffset: sliceTextureOffset, oceanColor: oceanColor,
+    rgb: rgb, projectIsland: projectIsland, nextCamera: nextCamera,
+    jetWidthPx: jetWidthPx, skyDarkness: skyDarkness,
+    altScale: altScale, currentCameraParams: currentCameraParams,
+    setPixelSize: setPixelSize, getPixelSize: getPixelSize,
+    effectiveSpeed: effectiveSpeed,
+    state: state, keys: keys, mouse: mouse,
+    step: step, cycleCamera: cycleCamera, startRoll: startRoll
+  };
+}
+</script>
+</body>
+</html>
